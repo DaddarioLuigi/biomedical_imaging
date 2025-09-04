@@ -1,12 +1,10 @@
-# src/train.py
-# Training script minimale con callback e riproducibilità
-
 import os
 import json
 import argparse
 import random
 import numpy as np
 import tensorflow as tf
+from tensorflow.keras.callbacks import TensorBoard
 
 from datetime import datetime
 from tensorflow.keras.callbacks import (
@@ -19,7 +17,7 @@ from src.model import build_unet_3d, dice_coefficient, iou_coefficient
 
 
 # ---------------------------
-# Utilità
+# Utility
 # ---------------------------
 def set_global_seed(seed: int = 42):
     random.seed(seed)
@@ -38,7 +36,8 @@ def get_callbacks(out_dir: str):
         ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=10, min_lr=1e-6, verbose=1),
         EarlyStopping(monitor="val_loss", patience=20, restore_best_weights=True, verbose=1),
         ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True, verbose=1),
-        CSVLogger(csv_path)
+        CSVLogger(csv_path),
+        TensorBoard(log_dir=os.path.join(out_dir, "tb"))  
     ]
     return cbs
 
@@ -54,7 +53,7 @@ def save_config(cfg: dict, out_dir: str):
 
 
 # ---------------------------
-# Main training
+# Training
 # ---------------------------
 def main(args):
     set_global_seed(args.seed)
