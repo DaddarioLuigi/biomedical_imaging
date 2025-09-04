@@ -1,7 +1,3 @@
-# src/inference.py
-# Inference minimale: CT (NIfTI) -> mask (NIfTI)
-# Usa stesso preprocessing del training: HU window + min-max [0,1]
-
 import os
 import argparse
 import numpy as np

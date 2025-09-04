@@ -32,12 +32,16 @@ def get_callbacks(out_dir: str):
     ckpt_path = os.path.join(out_dir, "best_model.keras")
     csv_path  = os.path.join(out_dir, "training_log.csv")
 
+    tb_dir = os.path.join("results", "logs", "tb", os.path.basename(out_dir))
+    os.makedirs(tb_dir, exist_ok=True)
+    print(f"Tensorboard logging -> {tb_dir}")
+
     cbs = [
         ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=10, min_lr=1e-6, verbose=1),
         EarlyStopping(monitor="val_loss", patience=20, restore_best_weights=True, verbose=1),
         ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True, verbose=1),
         CSVLogger(csv_path),
-        TensorBoard(log_dir=os.path.join(out_dir, "tb"))  
+        TensorBoard(log_dir=tb_dir, update_freq='epoch', write_graph=False)  
     ]
     return cbs
 

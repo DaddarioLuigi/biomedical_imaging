@@ -1,6 +1,3 @@
-# src/model.py
-# 3D U-Net con residui (come nel notebook) + aggiunte anti-overfitting marcate NEW
-
 from typing import Tuple
 import tensorflow as tf
 from tensorflow.keras import Model

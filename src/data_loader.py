@@ -1,4 +1,3 @@
-# src/data_loader.py
 import os
 import glob
 import numpy as np

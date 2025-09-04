@@ -1,4 +1,3 @@
-# src/sequence.py
 # Keras Sequence minimale per 3D lung segmentation
 # - legge path da split['train'|'val'|'test']
 # - usa DataLoader.load_case(case_dir)
