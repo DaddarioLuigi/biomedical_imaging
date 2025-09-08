@@ -4,6 +4,11 @@ import numpy as np
 import nibabel as nib
 from sklearn.model_selection import train_test_split
 
+"""
+ This class scans a dataset folder and loads CT volumes with lung masks.
+ It applies a Hounsfield Unit window, normalizes intensities, and returns arrays.
+ It can also split the dataset into train/val/test by patient folders.
+"""
 class DataLoader:
     def __init__(self, data_dir, wmin=-1000, wmax=300, add_channel=True):
         self.data_dir = data_dir
@@ -20,11 +25,11 @@ class DataLoader:
             and os.path.exists(os.path.join(d, "lung.nii.gz"))
         )
         if not case_dirs:
-            raise FileNotFoundError(f"Nessun caso valido in {self.data_dir}")
+            raise FileNotFoundError(f"No valid samples in {self.data_dir}")
         return case_dirs
 
     def _apply_hu_window(self, x):
-        """Clipping HU diretto nella classe"""
+        """Clipping HU directly in the class"""
         return np.clip(x, self.wmin, self.wmax)
 
     def _normalize_minmax(self, x):
@@ -48,7 +53,7 @@ class DataLoader:
         ct = self._apply_hu_window(ct)
         ct = self._normalize_minmax(ct)
 
-        # maschera binaria
+        # binary mask
         mk = (mk > 0).astype(np.float32)
 
         if self.add_channel:
@@ -60,7 +65,7 @@ class DataLoader:
     def split(self, ratios=(0.7, 0.15, 0.15), seed=42):
         r_train, r_val, r_test = ratios
         if abs((r_train + r_val + r_test) - 1.0) > 1e-6:
-            raise ValueError("Le proporzioni devono sommare a 1.0")
+            raise ValueError("Proportions must sum to 1.0")
 
         train, temp = train_test_split(self.cases, test_size=(1 - r_train),
                                        random_state=seed, shuffle=True)

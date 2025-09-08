@@ -1,147 +1,197 @@
 from typing import Tuple
-import tensorflow as tf
-from tensorflow.keras import Model
-from tensorflow.keras.layers import (
-    Input, Conv3D, Conv3DTranspose, UpSampling3D, MaxPooling3D,
-    BatchNormalization, Activation, Concatenate, Add, Dropout
-)
-from tensorflow.keras.regularizers import l2
-from tensorflow.keras import backend as K
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-# ---------------------------
-# Metriche & loss
-# ---------------------------
-def dice_coefficient(y_true, y_pred, smooth=1e-6):
-    y_true = K.cast(y_true, 'float32')
-    y_pred = K.cast(y_pred, 'float32')
-    intersection = K.sum(y_true * y_pred)
-    union = K.sum(y_true) + K.sum(y_pred)
+"""
+Computes Dice coefficient for binary masks.
+Parameters:
+    y_true: (N,1,D,H,W) float tensor in {0,1}
+    y_pred: (N,1,D,H,W) float tensor in [0,1]
+"""
+def dice_coefficient_torch(y_true: torch.Tensor, y_pred: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+    y_true = y_true.float()
+    y_pred = y_pred.float()
+    intersection = torch.sum(y_true * y_pred)
+    union = torch.sum(y_true) + torch.sum(y_pred)
     return (2.0 * intersection + smooth) / (union + smooth)
 
-def dice_loss(y_true, y_pred):
-    return 1.0 - dice_coefficient(y_true, y_pred)
 
-def iou_coefficient(y_true, y_pred, smooth=1e-6):
-    y_true = K.cast(y_true, 'float32')
-    y_pred = K.cast(y_pred, 'float32')
-    intersection = K.sum(y_true * y_pred)
-    total = K.sum(y_true) + K.sum(y_pred)
+def dice_loss_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+    return 1.0 - dice_coefficient_torch(y_true, y_pred)
+
+
+def iou_coefficient_torch(y_true: torch.Tensor, y_pred: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+    y_true = y_true.float()
+    y_pred = y_pred.float()
+    intersection = torch.sum(y_true * y_pred)
+    total = torch.sum(y_true) + torch.sum(y_pred)
     union = total - intersection
     return (intersection + smooth) / (union + smooth)
 
+"""
+This is a small building block for 3D CNNs.
+It applies a 3D convolution, then batch normalization, then a ReLU activation.
+Use it to extract features while keeping code concise and consistent.
+"""
+class Conv3DBNReLU(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, reg_l2: float = 0.0):
+        super().__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn = nn.BatchNorm3d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.reg_l2 = reg_l2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+
+
+"""
+This is an encoder block that downsamples features.
+It runs two Conv3D+BN+ReLU layers, keeps a skip copy, then downsamples.
+A residual 1x1 path matches shape so we can add it to the downsampled main path.
+"""
+class DownBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, reg_l2: float = 0.0, p_dropout: float = 0.0):
+        super().__init__()
+        self.conv1 = Conv3DBNReLU(in_channels, out_channels, reg_l2)
+        self.conv2 = Conv3DBNReLU(out_channels, out_channels, reg_l2)
+        self.dropout = nn.Dropout3d(p=p_dropout) if p_dropout > 0 else nn.Identity()
+        self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.resid = nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=2, padding=0, bias=False)
+
+    def forward(self, x: torch.Tensor):
+        x1 = self.conv1(x)
+        x1 = self.conv2(x1)
+        x1 = self.dropout(x1)
+        skip = x1
+        main = self.pool(x1)
+        resid = self.resid(x)
+        out = main + resid
+        return out, skip
+
+"""
+This is a decoder block that upsamples features.
+It upsamples the input, concatenates the matching encoder skip, then refines with convs.
+A residual upsampled path is also added for stable learning and better gradients.
+"""
+class UpBlock(nn.Module):
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int, reg_l2: float = 0.0,
+                 use_transpose: bool = False, p_dropout: float = 0.0):
+        super().__init__()
+        if use_transpose:
+            self.up = nn.ConvTranspose3d(in_channels, out_channels, kernel_size=2, stride=2)
+            up_out_channels = out_channels
+        else:
+            self.up = nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
+                nn.Conv3d(in_channels, out_channels, kernel_size=1)
+            )
+            up_out_channels = out_channels
+
+        self.conv1 = Conv3DBNReLU(up_out_channels + skip_channels, out_channels, reg_l2)
+        self.conv2 = Conv3DBNReLU(out_channels, out_channels, reg_l2)
+        self.dropout = nn.Dropout3d(p=p_dropout) if p_dropout > 0 else nn.Identity()
+        self.resid_up = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
+            nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        )
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        up = self.up(x)
+        x2 = torch.cat([up, skip], dim=1)
+        x2 = self.conv1(x2)
+        x2 = self.conv2(x2)
+        x2 = self.dropout(x2)
+        resid = self.resid_up(x)
+        out = x2 + resid
+        return out
+
+
+"""
+This class builds the full 3D U-Net with residual connections.
+It encodes the input volume, processes a bottleneck, then decodes with skip connections.
+The output is a single-channel probability map (sigmoid) for segmentation.
+"""
+class UNet3DResidual(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        base_filters: int = 16,
+        reg_l2: float = 1e-5,
+        p_dropout_enc: float = 0.1,
+        p_dropout_dec: float = 0.1,
+        p_dropout_bot: float = 0.1,
+        use_transpose: bool = False,
+    ):
+        super().__init__()
+        bf = base_filters
+        self.down1 = DownBlock(in_channels, bf, reg_l2, p_dropout_enc)
+        self.down2 = DownBlock(bf, bf * 2, reg_l2, p_dropout_enc)
+        self.down3 = DownBlock(bf * 2, bf * 4, reg_l2, p_dropout_enc)
+        self.down4 = DownBlock(bf * 4, bf * 8, reg_l2, p_dropout_enc)
+
+        self.bot1 = Conv3DBNReLU(bf * 8, bf * 16, reg_l2)
+        self.bot_drop = nn.Dropout3d(p=p_dropout_bot) if p_dropout_bot > 0 else nn.Identity()
+        self.bot2 = Conv3DBNReLU(bf * 16, bf * 16, reg_l2)
+
+        self.up3 = UpBlock(bf * 16, bf * 8, bf * 8, reg_l2, use_transpose, p_dropout_dec)
+        self.up2 = UpBlock(bf * 8, bf * 4, bf * 4, reg_l2, use_transpose, p_dropout_dec)
+        self.up1 = UpBlock(bf * 4, bf * 2, bf * 2, reg_l2, use_transpose, p_dropout_dec)
+        self.up0 = UpBlock(bf * 2, bf, bf, reg_l2, use_transpose, p_dropout_dec)
+
+        self.out_conv = nn.Conv3d(bf, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N,1,D,H,W)
+        x1, s1 = self.down1(x)
+        x2, s2 = self.down2(x1)
+        x3, s3 = self.down3(x2)
+        x4, s4 = self.down4(x3)
+
+        b = self.bot1(x4)
+        b = self.bot_drop(b)
+        b = self.bot2(b)
+
+        u3 = self.up3(b, s4)
+        u2 = self.up2(u3, s3)
+        u1 = self.up1(u2, s2)
+        u0 = self.up0(u1, s1)
+
+        out = self.out_conv(u0)
+        out = torch.sigmoid(out)
+        return out
+
 
 # ---------------------------
-# Blocchi base (come nel notebook)
-# ---------------------------
-def conv3_bn_relu(x, filters, reg=0.0):
-    x = Conv3D(filters, 3, padding='same',
-               kernel_regularizer=l2(reg) if reg > 0 else None)(x)  # NEW: L2 opzionale
-    x = BatchNormalization()(x)
-    x = Activation('relu')(x)
-    return x
-
-def down_block(x, filters, reg=0.0, p_dropout=0.0):
-    """
-    Encoder block con residuo downsampled (come nel notebook descritto):
-      main:   Conv3x3 -> BN -> ReLU (x2 o x3) -> MaxPool(stride2)
-      resid:  Conv1x1(stride2) per matchare canali/spatial
-      out:    Add(main_pooled, resid)
-      skip:   feature prima del pooling (per le skip connection)
-    """
-    # conv stack
-    x1 = conv3_bn_relu(x, filters, reg)
-    x1 = conv3_bn_relu(x1, filters, reg)
-    # NEW: dropout opzionale nell'encoder
-    if p_dropout > 0:
-        x1 = Dropout(p_dropout)(x1)  # NEW
-    skip = x1
-    main = MaxPooling3D(pool_size=2)(x1)
-    resid = Conv3D(filters, 1, strides=2, padding='same',
-                   kernel_regularizer=l2(reg) if reg > 0 else None)(x)  # residual downsample
-    out = Add()([main, resid])
-    return out, skip
-
-def up_block(x, skip, filters, reg=0.0, use_transpose=True, p_dropout=0.0):
-    """
-    Decoder block con upsample + skip (come nel notebook) + residuo upsampled.
-      upsample: Conv3DTranspose o UpSampling3D+Conv1x1 (switch)
-      concat con skip
-      conv stack
-      resid: UpSampling3D + Conv1x1 per matchare
-      out: Add(main, resid)
-    """
-    if use_transpose:
-        up = Conv3DTranspose(filters, 2, strides=2, padding='same',
-                             kernel_regularizer=l2(reg) if reg > 0 else None)(x)
-    else:
-        # NEW: alternativa per ridurre checkerboard: UpSampling3D + Conv1x1
-        up = UpSampling3D(size=2)(x)  # NEW
-        up = Conv3D(filters, 1, padding='same',
-                    kernel_regularizer=l2(reg) if reg > 0 else None)(up)  # NEW
-
-    x2 = Concatenate()([up, skip])
-    x2 = conv3_bn_relu(x2, filters, reg)
-    x2 = conv3_bn_relu(x2, filters, reg)
-    # NEW: dropout opzionale nel decoder
-    if p_dropout > 0:
-        x2 = Dropout(p_dropout)(x2)  # NEW
-
-    resid = UpSampling3D(size=2)(x)
-    resid = Conv3D(filters, 1, padding='same',
-                   kernel_regularizer=l2(reg) if reg > 0 else None)(resid)
-    out = Add()([x2, resid])
-    return out
-
-
-# ---------------------------
-# Costruzione U-Net 3D
+# BUILD MODEL
+#Returns a PyTorch UNet3DResidual
 # ---------------------------
 def build_unet_3d(
     input_shape: Tuple[int, int, int, int] = (64, 64, 64, 1),
     base_filters: int = 16,
-    reg_l2: float = 1e-5,          # NEW: L2 globale
-    p_dropout_enc: float = 0.1,    # NEW: dropout encoder
-    p_dropout_dec: float = 0.1,    # NEW: dropout decoder
-    p_dropout_bot: float = 0.1,    # NEW: dropout bottleneck
-    use_transpose: bool = False    # NEW: default UpSampling3D+Conv più stabile
-) -> Model:
+    reg_l2: float = 1e-5,
+    p_dropout_enc: float = 0.1,
+    p_dropout_dec: float = 0.1,
+    p_dropout_bot: float = 0.1,
+    use_transpose: bool = False
+) -> nn.Module:
     """
-    Ricalca l'architettura del notebook (down/up con residui) con:
-      - L2, Dropout, switch upsampling (NEW)
+   
     """
-    inputs = Input(shape=input_shape)
-
-    # Encoder
-    x0 = inputs
-    x1, s1 = down_block(x0, base_filters,         reg=reg_l2, p_dropout=p_dropout_enc)
-    x2, s2 = down_block(x1, base_filters * 2,     reg=reg_l2, p_dropout=p_dropout_enc)
-    x3, s3 = down_block(x2, base_filters * 4,     reg=reg_l2, p_dropout=p_dropout_enc)
-    x4, s4 = down_block(x3, base_filters * 8,     reg=reg_l2, p_dropout=p_dropout_enc)
-
-    # Bottleneck
-    b  = conv3_bn_relu(x4, base_filters * 16, reg=reg_l2)
-    if p_dropout_bot > 0:
-        b = Dropout(p_dropout_bot)(b)  # NEW
-    b  = conv3_bn_relu(b, base_filters * 16, reg=reg_l2)
-
-    # Decoder
-    u3 = up_block(b,  s4, base_filters * 8, reg=reg_l2, use_transpose=use_transpose, p_dropout=p_dropout_dec)
-    u2 = up_block(u3, s3, base_filters * 4, reg=reg_l2, use_transpose=use_transpose, p_dropout=p_dropout_dec)
-    u1 = up_block(u2, s2, base_filters * 2, reg=reg_l2, use_transpose=use_transpose, p_dropout=p_dropout_dec)
-    u0 = up_block(u1, s1, base_filters,     reg=reg_l2, use_transpose=use_transpose, p_dropout=p_dropout_dec)
-
-    # Output (sigmoid per binary mask)
-    out = Conv3D(1, 1, padding='same',
-                 kernel_regularizer=l2(reg_l2) if reg_l2 > 0 else None)(u0)
-    out = Activation('sigmoid')(out)
-
-    model = Model(inputs, out, name="unet3d_residual")
-
-    # Compilazione standard per il laboratorio
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4, amsgrad=True),
-        loss=dice_loss,                   # conforme al notebook / assignment
-        metrics=[dice_coefficient, iou_coefficient]
+    model = UNet3DResidual(
+        in_channels=1,
+        base_filters=base_filters,
+        reg_l2=reg_l2,
+        p_dropout_enc=p_dropout_enc,
+        p_dropout_dec=p_dropout_dec,
+        p_dropout_bot=p_dropout_bot,
+        use_transpose=use_transpose,
     )
     return model
+
+

@@ -2,10 +2,14 @@ import os
 import argparse
 import numpy as np
 import nibabel as nib
-import tensorflow as tf
+import torch
+
+from src.model import build_unet_3d
+
 
 def _apply_hu_window(x, wmin=-1000, wmax=300):
     return np.clip(x.astype(np.float32), wmin, wmax)
+
 
 def _normalize_minmax(x):
     x = x.astype(np.float32)
@@ -14,26 +18,29 @@ def _normalize_minmax(x):
         return np.zeros_like(x, dtype=np.float32)
     return (x - mn) / (mx - mn)
 
+
+"""
+If input_path is a folder, look for ct.nii.gz inside it.
+On the contrary, assume it is a CT NIfTI file.
+Returns (ct_array, nib_ref_path)
+"""
 def _load_ct_from_case(input_path):
-    """
-    Se input_path è una cartella, cerca ct.nii.gz al suo interno.
-    Altrimenti assume sia un file NIfTI di CT.
-    Restituisce (ct_array, nib_ref_path)
-    """
     if os.path.isdir(input_path):
         ct_path = os.path.join(input_path, "ct.nii.gz")
         if not os.path.exists(ct_path):
-            raise FileNotFoundError(f"ct.nii.gz non trovato in {input_path}")
+            raise FileNotFoundError(f"ct.nii.gz not found in {input_path}")
         ref_path = ct_path
     else:
         ref_path = input_path
     ct = nib.load(ref_path).get_fdata().astype(np.float32)
     return ct, ref_path
 
+
 def _save_nifti_like(reference_path, data, out_path, dtype=np.float32):
     ref = nib.load(reference_path)
     nii = nib.Nifti1Image(np.asarray(data, dtype=dtype), affine=ref.affine, header=ref.header)
     nib.save(nii, out_path)
+
 
 def run_inference(
     model_path: str,
@@ -44,52 +51,56 @@ def run_inference(
     threshold: float = 0.5,
     save_prob_path: str | None = None
 ):
-    # 1) carica CT
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1)Load CT
     ct, ref_path = _load_ct_from_case(input_path)
 
-    # 2) preprocessing come nel training
+    # 2)Preprocessing (same as training)
     ct = _apply_hu_window(ct, wmin=wmin, wmax=wmax)
     ct = _normalize_minmax(ct)
     if ct.ndim != 3:
-        raise ValueError(f"CT atteso 3D, trovato shape {ct.shape}")
-    ct = ct[..., None]  # (D,H,W,1)
-    x = np.expand_dims(ct, axis=0)  # (1,D,H,W,1)
+        raise ValueError(f"CT expected 3D, got shape {ct.shape}")
+    x = np.expand_dims(ct, axis=(0, -1))  # (1,D,H,W,1)
+    x = np.transpose(x, (0, 4, 1, 2, 3))  # (1,1,D,H,W)
 
-    # 3) carica modello
-    # NOTA: il modello è stato compilato con dice/iou custom;
-    # per sola inferenza non servono custom_objects, ma se servissero:
-    # from src.model import dice_coefficient, iou_coefficient, dice_loss
-    # custom = {'dice_coefficient': dice_coefficient, 'iou_coefficient': iou_coefficient, 'dice_loss': dice_loss}
-    # model = tf.keras.models.load_model(model_path, custom_objects=custom)
-    model = tf.keras.models.load_model(model_path, compile=False)
+    # 3)Load model
+    model = build_unet_3d()
+    ckpt = torch.load(model_path, map_location=device)
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        model.load_state_dict(ckpt['model_state_dict'])
+    else:
+        model.load_state_dict(ckpt)
+    model.to(device)
+    model.eval()
 
-    # 4) predici
-    y_prob = model.predict(x, verbose=0)[0]  # (D,H,W,1)
-    y_prob = np.squeeze(y_prob, axis=-1)     # (D,H,W)
+    # 4)Prediction
+    with torch.no_grad():
+        x_tensor = torch.from_numpy(x).float().to(device)
+        y_prob = model(x_tensor).cpu().numpy()[0, 0]  # (D,H,W)
 
-    # 5) soglia e salva
+    # 5)Threshold and save
     y_bin = (y_prob >= float(threshold)).astype(np.uint8)
 
-    # salva maschera binaria
     _save_nifti_like(ref_path, y_bin, out_mask_path, dtype=np.uint8)
 
-    # opzionale: salva la probabilità
     if save_prob_path is not None and len(save_prob_path) > 0:
         _save_nifti_like(ref_path, y_prob, save_prob_path, dtype=np.float32)
 
-    print(f"[OK] Salvato mask: {out_mask_path}")
+    print(f"Saved mask: {out_mask_path}")
     if save_prob_path:
-        print(f"[OK] Salvato prob:  {save_prob_path}")
+        print(f"Saved prob:  {save_prob_path}")
+
 
 def main():
-    ap = argparse.ArgumentParser(description="Inferenza 3D lung segmentation")
-    ap.add_argument("--model", required=True, help="Percorso al modello .keras (best_model.keras)")
-    ap.add_argument("--input", required=True, help="Cartella paziente (con ct.nii.gz) oppure file CT .nii/.nii.gz")
-    ap.add_argument("--output_mask", required=True, help="Percorso di output per la maschera binaria NIfTI")
-    ap.add_argument("--output_prob", default=None, help="(Opzionale) Percorso di output per la probabilità NIfTI float")
+    ap = argparse.ArgumentParser(description="Inference 3D lung segmentation")
+    ap.add_argument("--model", required=True, help="Path to model .pt checkpoint (best_model.pt)")
+    ap.add_argument("--input", required=True, help="Patient folder (with ct.nii.gz) or CT .nii/.nii.gz file")
+    ap.add_argument("--output_mask", required=True, help="Output path for binary mask NIfTI")
+    ap.add_argument("--output_prob", default=None, help="(Optional) Output path for probability NIfTI float")
     ap.add_argument("--wmin", type=int, default=-1000, help="HU window min")
     ap.add_argument("--wmax", type=int, default=300, help="HU window max")
-    ap.add_argument("--thr", type=float, default=0.5, help="Soglia di binarizzazione")
+    ap.add_argument("--thr", type=float, default=0.5, help="Binarization threshold")
     args = ap.parse_args()
 
     run_inference(
@@ -101,6 +112,7 @@ def main():
         threshold=args.thr,
         save_prob_path=args.output_prob
     )
+
 
 if __name__ == "__main__":
     main()

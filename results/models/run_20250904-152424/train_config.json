@@ -1,0 +1,21 @@
+{
+  "data_dir": "data/lctsc",
+  "out_dir": "results/models",
+  "wmin": -1000,
+  "wmax": 300,
+  "train_ratio": 0.7,
+  "val_ratio": 0.15,
+  "test_ratio": 0.15,
+  "seed": 42,
+  "base_filters": 16,
+  "reg_l2": 1e-05,
+  "dropout_enc": 0.1,
+  "dropout_dec": 0.1,
+  "dropout_bot": 0.1,
+  "use_transpose": false,
+  "batch_size": 2,
+  "epochs": 2,
+  "lr": null,
+  "p_jitter": 0.2,
+  "jitter_sigma": 0.03
+}
